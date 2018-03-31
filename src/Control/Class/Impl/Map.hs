@@ -1,7 +1,6 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -11,7 +10,10 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 {-|
-'Control.Class.Map' provides a number of type-classes that encapulate the idea
+If you just want to perform operations on maps, not write your own instances,
+"Control.Class.Map" is probably what you should be importing.
+
+This package provides a number of type-classes that encapulate the idea
 of a key/value mapping. This includes your standard maps, but also arrays
 and potentially hashtables. This library only currently provide instances
 for types in package that are distributed with GHC.
@@ -26,7 +28,7 @@ If the key already exists in the map, which of the following occurs?
 3. 'error' is called.
 4. The result is undefined.
 
-Personally, I had to chcck the documentation. The answer is actually option "2".
+Personally, I had to check the documentation. The answer is actually option "2".
 
 Imagine the potential minefield when changing collection types.
 
@@ -57,8 +59,8 @@ There's a number of prefixes to function which affect expected behaviour.
    in demons if they access memory they shouldn't.
 3. The "maybe" prefixed functions shall not call 'error' if the operation can
    not be completed but instead return the structure unchanged.
-4. The "safe" prefixed functions actually have a 'Maybe' return type so should
-   return nothiing.
+4. The "safe" prefixed functions actually have a 'Maybe' return type which indicate
+   whether the key is not found/already exists on insert.
 
 Functions suffixed with "Lookup" actually have a different return type and
 generally allow one to access the contents of the structure before the change,
@@ -68,23 +70,46 @@ performing the operation. However, for example with 'deleteLookup' on a map,
 it would be more efficient to just lookup the element to delete, grab it and delete
 it at the same time, so there is a point in overriding the default implementation.
 
-To Do: Range lookups (and perhaps even range deletes?). For maps, range lookups
-are not only possible but also faster than accessing the keys individually.
+Finally, you may notice some of the class functions that ordinarily accept a 'Functor',
+are renamed ending with a @..F_@, and now have the 'Functor' wrapped in a 'Coyoneda'.
+This is because having 'Functor's in class function defintions
+does not work with generalised newtype deriving.
+
+The versions of the functions without the following underscores, i.e. @..F@
+are what users should be using. When defining your own instances for these
+functions, it's probably best just apply 'toCoyonedaTransform'/'toCoyonedaTransformF'
+to their ordinary definitions. The non underscore style defintions run
+'fromCoyonedaTransform'/'fromCoyonedaTransformF' on the class functions.
+Ideally rewrite rules included in these modules should reduce this pair of
+functions to 'id' resulting in no runtime difference.
+
+Regarding trailing @F@ on the latter 'toCoyonedaTransform'/'toCoyonedaTransformF'
+function, use that when defining such 'Coyondea' class functions which have
+return types wrapped in 'Maybe', namely the ones prefixed with @safe...@.
+
+To Do: Monadic versions of these functions, to be used on mutable structures for example.
+
+Also To Do: Range lookups (and perhaps even range deletes?). In theory, for say maps,
+range lookups are not only possible but also faster than accessing the keys individually.
 But they've impossible for say hashmaps.
+
+Pull requests welcome on github.
 -}
+
 module Control.Class.Impl.Map (
-{-
   Key, Value,
   LookupMap(..),
   SingletonMap(..),
-  UpdateMap(..),
-  AlterMap(..),
-  LookupMapM(..),
-  SingletonMapM(..),
-  UpdateMapM(..),
-  AlterMapM(..),
-  Strict(..), Lazy(..)
-  -}
+  InsertMap(..),
+  UpdateMap(..), adjustF, unsafeAdjustF, safeAdjustF,
+  DeleteMap(..), optDeleteF, unsafeOptDeleteF, safeOptDeleteF,
+  UpsertMap(..), adsertF,
+  UpleteMap(..), adleteF, unsafeAdleteF, safeAdleteF,
+  AlterMap(..), alterF,
+  Strict(..), Lazy(..),
+  (!),
+  fromCoyonedaTransform, fromCoyonedaTransformF,
+  toCoyonedaTransform, toCoyonedaTransformF,
   ) where
 
 import qualified Data.Map.Strict
@@ -97,28 +122,13 @@ import qualified Data.IntSet
 import Data.IntSet (IntSet)
 import qualified Data.Sequence
 import Data.Sequence (Seq)
-import qualified Data.Ix
 import Data.Ix (Ix)
 import qualified Data.Array.IArray
-import Data.Array.IArray (IArray, Array)
-import Data.Array.Unboxed (UArray)
-import qualified Data.Array.MArray
-import Data.Array.MArray (MArray)
-import Data.Array.IO (IOArray, IOUArray)
-import Data.Array.ST (STArray, STUArray)
-import Data.Array.Storable (StorableArray)
-
-import qualified Data.STRef.Strict as Strict
-import qualified Data.STRef.Lazy as Lazy
-import qualified Control.Monad.ST.Strict as Strict (ST)
-import qualified Control.Monad.ST.Lazy as Lazy (ST)
 
 import Prelude hiding (lookup)
 import qualified Control.Class.Impl.Map.CPP
 
-import Data.Maybe (fromJust, fromMaybe, isJust)
-
-import Data.Monoid (mempty)
+import Data.Maybe (fromMaybe, isJust)
 
 import Data.Functor.Identity (Identity(Identity, runIdentity))
 
@@ -128,12 +138,18 @@ import Data.Maybe.HT (toMaybe)
 
 import Data.Coerce (Coercible, coerce)
 import Data.Functor.Coyoneda (Coyoneda, liftCoyoneda, lowerCoyoneda)
+
 import Data.Array (Array)
-import qualified Data.Array.IArray
 
 import qualified Data.ByteString
+import qualified Data.ByteString.Unsafe
+import qualified Data.ByteString.Lazy
+import qualified Data.ByteString.Short
 
 import Data.Word (Word8)
+import Data.Int (Int64)
+
+{-# ANN module "HLint: ignore Use if" #-}
 
 type family Key t
 type family Value t
@@ -165,10 +181,13 @@ toCoyonedaTransformF = id
 
 
 {-# RULES
+-- An attempt to remove going to and from Coyonedas.
 "fromToCoyonedaTransform"  forall (x :: forall f2' f1'. (a1 -> f2' a2) -> t1 -> t2 -> f1' a3). fromCoyonedaTransform (toCoyonedaTransform x) = x
 "fromToCoyonedaTransformF" forall (x :: forall f2' f1'. (a1 -> f2' a2) -> t1 -> t2 -> f3 (f1' a3)). fromCoyonedaTransformF (toCoyonedaTransformF x) = x
+-- How do I write these rules? Should I even write these rules?
+-- "fromToCoyonedaTransform"  fromCoyonedaTransform . toCoyonedaTransform = id
+-- "fromToCoyonedaTransformF" fromCoyonedaTransformF . toCoyonedaTransformF = id
 #-}
-
 {-|
 'LookupMap' is a class that simply represents data types indexable by a key that
 you can read from. Whilst obviously not enforced by the class, it's intended that
@@ -184,8 +203,13 @@ You could in theory implement 'LookupMap'
 multiple keys, by making the key type a sum type or a list or something.
 -}
 class LookupMap t where
+  {-# MINIMAL lookup | ((unsafeIndex | index), member) #-}
+
   {-| @lookup k x@ returns @Just v@ if @k@ is a key, @Nothing@ otherwise -}
   lookup :: Key t -> t -> Maybe (Value t)
+  lookup k x = case member k x of
+    True -> Just (unsafeIndex k x)
+    False -> Nothing
 
   {-| Like 'lookup' but throws an error for values that don't exist -}
   index :: Key t -> t -> Value t
@@ -199,7 +223,7 @@ class LookupMap t where
   member k x = isJust (lookup k x)
 
   notMember :: Key t -> t -> Bool
-  notMember k x = not $ member k x
+  notMember k x = not (member k x)
 
 {-|
 Data types you can produce a one element container of.
@@ -257,7 +281,7 @@ class LookupMap t => UpdateMap t where
   safeUpdate k v x = snd <$> safeUpdateLookup k v x
 
   safeUpdateLookup :: Key t -> Value t -> t -> Maybe (Value t, t)
-  safeUpdateLookup k v x = safeAdjustLookup g k x where
+  safeUpdateLookup k v = safeAdjustLookup g k where
     g old_v = (old_v, v)
 
   {-|
@@ -295,7 +319,7 @@ class LookupMap t => UpdateMap t where
 
   safeAdjustF_ :: Functor f => (Value t -> Coyoneda f (Value t)) -> Key t -> t -> Maybe (Coyoneda f t)
   default safeAdjustF_ :: (UpsertMap t, Functor f) => (Value t -> Coyoneda f (Value t)) -> Key t -> t -> Maybe (Coyoneda f t)
-  safeAdjustF_ = defaultSafeAdjustF_adsertF
+  safeAdjustF_ = defaultSafeAdjustFBasedOnAdsertF
 
 unsafeAdjustF :: (UpdateMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> f t
 unsafeAdjustF = fromCoyonedaTransform unsafeAdjustF_
@@ -306,14 +330,11 @@ adjustF = fromCoyonedaTransform adjustF_
 safeAdjustF :: (UpdateMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
 safeAdjustF = fromCoyonedaTransformF safeAdjustF_
 
-defaultSafeAdjustF_adsertF :: (UpsertMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
-defaultSafeAdjustF_adsertF f k x = getCompose $ adsertF (Compose . (fmap f)) k x
+defaultSafeAdjustFBasedOnAdsertF :: (UpsertMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
+defaultSafeAdjustFBasedOnAdsertF f k x = getCompose $ adsertF (Compose . fmap f) k x
 
-defaultSafeAdjustF_safeAdleteF :: (UpleteMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
-defaultSafeAdjustF_safeAdleteF f k x = safeAdleteF ((Just <$>) . f) k x
-
-defaultSafeAdjustF_unsafe :: (UpdateMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
-defaultSafeAdjustF_unsafe f k x = g <$> lookup k x where
+defaultSafeAdjustFBasedOnUnsafeUpdate :: (UpdateMap t, Functor f) => (Value t -> f (Value t)) -> Key t -> t -> Maybe (f t)
+defaultSafeAdjustFBasedOnUnsafeUpdate f k x = g <$> lookup k x where
   g old_val =
     let
       new_x_func new_val = unsafeUpdate k new_val x
@@ -347,15 +368,10 @@ class LookupMap t => InsertMap t where
   -}
   safeInsert :: Key t -> Value t -> t -> Maybe t
   default safeInsert :: UpsertMap t => Key t -> Value t -> t -> Maybe t
-  safeInsert = defaultSafeInsert_adsertF
+  safeInsert = defaultSafeInsertBasedOnAdsertF
 
-defaultSafeInsert_unsafe :: InsertMap t => Key t -> Value t -> t -> Maybe t
-defaultSafeInsert_unsafe k v x = case member k x of
-  False -> Just $ unsafeInsert k v x
-  True -> Nothing
-
-defaultSafeInsert_adsertF :: UpsertMap t => Key t -> Value t -> t -> Maybe t
-defaultSafeInsert_adsertF k v x = adsertF (fmap (const v)) k x
+defaultSafeInsertBasedOnAdsertF :: UpsertMap t => Key t -> Value t -> t -> Maybe t
+defaultSafeInsertBasedOnAdsertF k v = adsertF (fmap (const v)) k
 
 {-|
 'DeleteMap' represents types where keys can be deleted.
@@ -389,10 +405,10 @@ class LookupMap t => DeleteMap t where
 
   {-| Like 'safeDelete', but also return the value of the key before the delete. -}
   safeDeleteLookup :: Key t -> t -> Maybe (Value t, t)
-  safeDeleteLookup k x = safeOptDeleteLookup g k x where
+  safeDeleteLookup = safeOptDeleteLookup g where
     g val = (val, True)
 
-  {-| Attempt to optDelete a key and call 'error' if it's not found. -}
+  {-| Attempt to optDelete a key based on it's value and call 'error' if it's not found. -}
   optDelete :: (Value t -> Bool) -> Key t -> t -> t
   optDelete f k x = fromMaybe (error "optDelete: key not found.") (safeOptDelete f k x)
 
@@ -428,7 +444,7 @@ class LookupMap t => DeleteMap t where
 
   safeOptDeleteF_ :: Functor f => (Value t -> Coyoneda f Bool) -> Key t -> t -> Maybe (Coyoneda f t)
   default safeOptDeleteF_ :: (UpleteMap t, Functor f) => (Value t -> Coyoneda f Bool) -> Key t -> t -> Maybe (Coyoneda f t)
-  safeOptDeleteF_ = defaultOptDeleteF_safeAdleteF
+  safeOptDeleteF_ = defaultOptDeleteFBasedOnSafeAdleteF
 
 
 unsafeOptDeleteF :: (DeleteMap t, Functor f) => (Value t -> f Bool) -> Key t -> t -> f t
@@ -440,18 +456,9 @@ optDeleteF = fromCoyonedaTransform optDeleteF_
 safeOptDeleteF :: (DeleteMap t, Functor f) => (Value t -> f Bool) -> Key t -> t -> Maybe (f t)
 safeOptDeleteF = fromCoyonedaTransformF safeOptDeleteF_
 
-defaultOptDeleteF_unsafe :: (DeleteMap t, Functor f) => (Value t -> f Bool) -> Key t -> t -> Maybe (f t)
-defaultOptDeleteF_unsafe f k x =
-  let
-    new_x_func to_delete = case to_delete of
-      True -> unsafeDelete k x
-      False -> x
-  in
-    ((fmap new_x_func) . f) <$> lookup k x
-
-defaultOptDeleteF_safeAdleteF :: (UpleteMap t, Functor f) => (Value t -> f Bool) -> Key t -> t -> Maybe (f t)
-defaultOptDeleteF_safeAdleteF f k x = safeAdleteF g k x where
-  g val = (`toMaybe` val) <$> (f val)
+defaultOptDeleteFBasedOnSafeAdleteF :: (UpleteMap t, Functor f) => (Value t -> f Bool) -> Key t -> t -> Maybe (f t)
+defaultOptDeleteFBasedOnSafeAdleteF f = safeAdleteF g where
+  g val = (`toMaybe` val) <$> f val
 
 {-|
 Functions for doing inserts that don't fail on the keys being found
@@ -462,7 +469,7 @@ class (InsertMap t, UpdateMap t) => UpsertMap t where
   upsert k v x = snd (upsertLookup k v x)
 
   upsertLookup :: Key t -> Value t -> t -> (Maybe (Value t), t)
-  upsertLookup k v x = adsertLookup g k x where
+  upsertLookup k v = adsertLookup g k where
     g old_v = (old_v, v)
 
   adsert :: (Maybe (Value t) -> Value t) -> Key t -> t -> t
@@ -474,24 +481,13 @@ class (InsertMap t, UpdateMap t) => UpsertMap t where
 
   adsertF_ :: Functor f => (Maybe (Value t) -> Coyoneda f (Value t)) -> Key t -> t -> Coyoneda f t
   default adsertF_ :: (AlterMap t, Functor f) => (Maybe (Value t) -> Coyoneda f (Value t)) -> Key t -> t -> Coyoneda f t
-  adsertF_ = defaultAdsertF_alterF
+  adsertF_ = defaultAdsertFBasedOnAlterF
 
 adsertF :: (UpsertMap t, Functor f) => (Maybe (Value t) -> f (Value t)) -> Key t -> t -> f t
 adsertF = fromCoyonedaTransform adsertF_
 
-defaultAdsertF_unsafe :: (InsertMap t, UpdateMap t, Functor f) => (Maybe (Value t) -> f (Value t)) -> Key t -> t -> f t
-defaultAdsertF_unsafe f k x =
-  let
-    maybe_curr_val = lookup k x
-    new_x_func new_val = g k new_val x where
-      g = case maybe_curr_val of
-        Just _ -> unsafeUpdate
-        Nothing -> unsafeInsert
-  in
-    new_x_func <$> f maybe_curr_val
-
-defaultAdsertF_alterF :: (AlterMap t, Functor f) => (Maybe (Value t) -> f (Value t)) -> Key t -> t -> f t
-defaultAdsertF_alterF f = alterF ((fmap Just) . f)
+defaultAdsertFBasedOnAlterF :: (AlterMap t, Functor f) => (Maybe (Value t) -> f (Value t)) -> Key t -> t -> f t
+defaultAdsertFBasedOnAlterF f = alterF (fmap Just . f)
 
 class (DeleteMap t, UpdateMap t) => UpleteMap t where
   adlete :: (Value t -> Maybe (Value t)) -> Key t -> t -> t
@@ -523,7 +519,7 @@ class (DeleteMap t, UpdateMap t) => UpleteMap t where
 
   safeAdleteF_ :: Functor f => (Value t -> Coyoneda f (Maybe (Value t))) -> Key t -> t -> Maybe (Coyoneda f t)
   default safeAdleteF_ :: (AlterMap t, Functor f) => (Value t -> Coyoneda f (Maybe (Value t))) -> Key t -> t -> Maybe (Coyoneda f t)
-  safeAdleteF_ = defaultSafeAdleteA_alterF
+  safeAdleteF_ = defaultSafeAdleteFBasedOnAlterF
 
 safeAdleteF :: (UpleteMap t, Functor f) => (Value t -> f (Maybe (Value t))) -> Key t -> t -> Maybe (f t)
 safeAdleteF = fromCoyonedaTransformF safeAdleteF_
@@ -534,18 +530,8 @@ unsafeAdleteF = fromCoyonedaTransform unsafeAdleteF_
 adleteF :: (UpleteMap t, Functor f) => (Value t -> f (Maybe (Value t))) -> Key t -> t -> f t
 adleteF = fromCoyonedaTransform adleteF_
 
-defaultSafeAdleteF_unsafe :: (DeleteMap t, UpdateMap t, Functor f) => (Value t -> f (Maybe (Value t))) -> Key t -> t -> Maybe (f t)
-defaultSafeAdleteF_unsafe f k x = g <$> lookup k x where
-  g old_val =
-    let
-      new_x_func new_val = case new_val of
-        Nothing -> unsafeDelete k x
-        Just new_val -> unsafeUpdate k new_val x
-    in
-      new_x_func <$> (f old_val)
-
-defaultSafeAdleteA_alterF :: (AlterMap t, Functor f) => (Value t -> f (Maybe (Value t))) -> Key t -> t -> Maybe (f t)
-defaultSafeAdleteA_alterF f k x = getCompose $ alterF (Compose . (fmap f)) k x
+defaultSafeAdleteFBasedOnAlterF :: (AlterMap t, Functor f) => (Value t -> f (Maybe (Value t))) -> Key t -> t -> Maybe (f t)
+defaultSafeAdleteFBasedOnAlterF f k x = getCompose $ alterF (Compose . fmap f) k x
 
 {-|
 'AlterMap' is a class that represents key-value mappings where one can do
@@ -578,13 +564,13 @@ class (UpsertMap t, UpleteMap t) => AlterMap t where
   alterLookup = alterF
 
   alterF_ :: Functor f => (Maybe (Value t) -> Coyoneda f (Maybe (Value t))) -> Key t -> t -> Coyoneda f t
-  alterF_ = defaultAlterF_unsafe
+  alterF_ = defaultAlterFBasedOnUnsafeInsertUpdateDelete
 
 alterF :: (AlterMap t, Functor f) => (Maybe (Value t) -> f (Maybe (Value t))) -> Key t -> t -> f t
 alterF = fromCoyonedaTransform alterF_
 
-defaultAlterF_unsafe :: (InsertMap t, UpdateMap t, DeleteMap t, Functor f) => (Maybe (Value t) -> f (Maybe (Value t))) -> Key t -> t -> f t
-defaultAlterF_unsafe f k x =
+defaultAlterFBasedOnUnsafeInsertUpdateDelete :: (InsertMap t, UpdateMap t, DeleteMap t, Functor f) => (Maybe (Value t) -> f (Maybe (Value t))) -> Key t -> t -> f t
+defaultAlterFBasedOnUnsafeInsertUpdateDelete f k x =
  let
    maybe_old_val = lookup k x
 
@@ -596,7 +582,7 @@ defaultAlterF_unsafe f k x =
        Nothing -> unsafeDelete k x
        Just new_val -> unsafeUpdate k new_val x
  in
-   new_x_func <$> (f maybe_old_val)
+   new_x_func <$> f maybe_old_val
 
 
 {-|
@@ -891,7 +877,7 @@ instance UpdateMap (Seq a) where
   maybeAdjust = Data.Sequence.adjust'
   unsafeUpdate = Data.Sequence.update
   maybeUpdate = Data.Sequence.update
-  safeAdjustF_ = defaultSafeAdjustF_unsafe
+  safeAdjustF_ = defaultSafeAdjustFBasedOnUnsafeUpdate
 instance AppendMap (Seq a) where
   append v x = x Data.Sequence.|> v
   appendGetKey v x = (Data.Sequence.length x, append v x)
@@ -900,16 +886,33 @@ type instance Key (Array i e) = i
 type instance Value (Array i e) = e
 instance IsLazyMap (Array i e)
 
-instance LookupMap (Array i e) where
-  lookup k x = case member of
-    True -> Just (unsafeIndex k x)
-    False -> Nothing
+instance Ix i => LookupMap (Array i e) where
   index = flip (Data.Array.IArray.!)
   member k x = let (lbound, ubound) = Data.Array.IArray.bounds x in (lbound <= k && k <= ubound)
 instance Ix i => SingletonMap (Array i e) where
   singleton k v = Data.Array.IArray.array (k,k) [(k,v)]
 
---type instance Key Data.ByteString.ByteString = Int
---type instance Key Data.ByteString.ByteString = Word8
+type instance Key Data.ByteString.ByteString = Int
+type instance Value Data.ByteString.ByteString = Word8
 
---instance LookupMap Data.ByteString.ByteString
+instance LookupMap Data.ByteString.ByteString where
+  index = flip Data.ByteString.index
+  member k x = 0 <= k && k < Data.ByteString.length x
+  unsafeIndex = flip Data.ByteString.Unsafe.unsafeIndex
+
+type instance Key Data.ByteString.Lazy.ByteString = Int64
+type instance Value Data.ByteString.Lazy.ByteString = Word8
+
+instance LookupMap Data.ByteString.Lazy.ByteString where
+  index = flip Data.ByteString.Lazy.index
+  member k x = 0 <= k && k < Data.ByteString.Lazy.length x
+
+type instance Key Data.ByteString.Short.ShortByteString = Int
+type instance Value Data.ByteString.Short.ShortByteString = Word8
+
+instance LookupMap Data.ByteString.Short.ShortByteString where
+  index = flip Data.ByteString.Short.index
+  member k x = 0 <= k && k < Data.ByteString.Short.length x
+
+(!) :: LookupMap t => t -> Key t -> Value t
+(!) = flip index

@@ -1,0 +1,42 @@
+name:                map-classes
+version:             0.1.0.0
+synopsis:            A set of classes and instances for working with key/value mappings.
+description:
+  Basically a broad extension to the 'IArray' interface for all sorts of key/value maps.
+
+
+  Arrays, maps etc can all use these classes so datatypes can be swapped in and out of algorithms.
+
+
+  The classes have plenty of functions, but also many default implementations,
+  so making instances for your datatypes should be relatively easy.
+
+
+  Of course, if you give specialised defintions you might get better performance
+  for some operations.
+
+
+  Currently only deals with pure structures but mutable structures are
+  next on the todo list.
+
+homepage:            https://github.com/clintonmead/map-classes
+license:             BSD3
+license-file:        LICENSE
+author:              "Clinton Mead"
+maintainer:          "clintonmead@gmail.com"
+copyright:           "Copyright: (c) 2018 Clinton Mead"
+category:            Control
+
+library:
+  source-dirs: src
+  exposed-modules:
+    - Control.Class.Map
+    - Control.Class.Impl.Map
+  dependencies:
+    - base < 99
+    - containers
+    - array
+    - transformers
+    - utility-ht
+    - kan-extensions
+    - bytestring
